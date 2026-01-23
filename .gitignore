@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python utils (if tools are added)
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Temp
+tmp/
+.cache/
