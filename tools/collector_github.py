@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import re
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,11 +11,12 @@ import requests
 
 GITHUB_API = "https://api.github.com"
 ROOT = Path(__file__).resolve().parent.parent
+
 EXCLUDE_FULL_NAMES = {
     "nomi-sec/PoC-in-GitHub",
-    #"trickest/cve",                 # часто агрегатор
-    #"vulncheck-oss/vulncheck-kev",  # примеры шумных баз (если всплывут)
 }
+
+CVE_RE = re.compile(r"\bCVE-(\d{4})-(\d{4,})\b", re.IGNORECASE)
 
 
 # ---------- utils ----------
@@ -44,13 +46,12 @@ def gh_get(url: str, token: str, params: dict | None = None) -> requests.Respons
 
 # ---------- GitHub search ----------
 
-def search_repos(token: str, cve: str) -> list[dict]:
-    query = f"{cve} in:name,description,readme"
+def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> list[dict]:
     url = f"{GITHUB_API}/search/repositories"
-
     params = {
         "q": query,
-        "per_page": 100,
+        "per_page": per_page,
+        "page": page,
         "sort": "indexed",
         "order": "desc",
     }
@@ -61,7 +62,6 @@ def search_repos(token: str, cve: str) -> list[dict]:
 
     items = r.json().get("items", [])
 
-    # 🔥 фильтр агрегаторов / шума
     filtered = [
         repo for repo in items
         if repo.get("full_name") not in EXCLUDE_FULL_NAMES
@@ -81,14 +81,6 @@ def cve_path(cve: str) -> Path:
 
 
 def load_existing(path: Path) -> list[dict]:
-    """
-    Accepts:
-    - []                              (nomi-sec style)
-    - { "entries": [] }
-    - { "items": [] }
-    - { "repos": [] }
-    - single repo object { id, full_name, ... }
-    """
     if not path.exists():
         return []
 
@@ -101,33 +93,23 @@ def load_existing(path: Path) -> list[dict]:
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Invalid JSON in {path}: {e}")
 
-    # 1) nomi-sec style
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
 
-    # 2) object containers
     if isinstance(data, dict):
         for key in ("entries", "items", "repos", "repositories"):
             if isinstance(data.get(key), list):
                 return [x for x in data[key] if isinstance(x, dict)]
-
-        # 3) single repo object
         if "id" in data and "full_name" in data:
             return [data]
-
-        raise RuntimeError(
-            f"Unsupported JSON object in {path}. Keys: {list(data.keys())}"
-        )
+        raise RuntimeError(f"Unsupported JSON object in {path}. Keys: {list(data.keys())}")
 
     raise RuntimeError(f"Unsupported JSON root type in {path}: {type(data).__name__}")
 
 
 def save(path: Path, data: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------- normalization & merge ----------
@@ -174,12 +156,63 @@ def merge(existing: list[dict], found: list[dict]) -> list[dict]:
     return safe_existing
 
 
+# ---------- discovery (year -> CVE list) ----------
+
+def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
+    cves: set[str] = set()
+
+    # from repo name (often exact)
+    full_name = repo.get("full_name") or ""
+    name = repo.get("name") or ""
+    desc = repo.get("description") or ""
+
+    for text in (full_name, name, desc):
+        for m in CVE_RE.finditer(text):
+            if m.group(1) == year:
+                cves.add(f"CVE-{year}-{m.group(2)}".upper())
+
+    # topics sometimes contain cve-202x-xxxx
+    for t in repo.get("topics", []) or []:
+        for m in CVE_RE.finditer(str(t)):
+            if m.group(1) == year:
+                cves.add(f"CVE-{year}-{m.group(2)}".upper())
+
+    return cves
+
+
+def discover_year_to_queue(token: str, year: str, pages: int, out_path: Path) -> None:
+    # Query that finds repos mentioning CVE-YYYY- in name/desc/readme
+    query = f"CVE-{year}- in:name,description,readme"
+
+    all_cves: set[str] = set()
+    total_repos = 0
+
+    for page in range(1, pages + 1):
+        repos = search_repos(token, query=query, per_page=100, page=page)
+        if not repos:
+            break
+
+        total_repos += len(repos)
+
+        for repo in repos:
+            all_cves |= extract_cves_from_repo(repo, year)
+
+        print(f"[+] discover {year}: page {page} -> repos={len(repos)} cves_total={len(all_cves)}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(sorted(all_cves)) + "\n", encoding="utf-8")
+
+    print(f"[+] Saved queue: {out_path} (cves={len(all_cves)} repos_scanned={total_repos})")
+
+
 # ---------- main ----------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cve", help="Process single CVE, e.g. CVE-2026-22444")
+    ap.add_argument("--discover-year", help="Discover CVEs for a given year from GitHub, e.g. 2026")
+    ap.add_argument("--discover-pages", type=int, default=5, help="How many search pages to scan (100 repos/page). Default: 5")
     args = ap.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -190,14 +223,24 @@ def main() -> None:
         print(json.dumps(r.json(), indent=2))
         return
 
+    if args.discover_year:
+        year = str(args.discover_year).strip()
+        if not re.fullmatch(r"\d{4}", year):
+            print("ERROR: --discover-year must be YYYY", file=sys.stderr)
+            sys.exit(1)
+
+        out_path = ROOT / "tools" / f"queue_{year}.txt"
+        discover_year_to_queue(token, year=year, pages=max(1, args.discover_pages), out_path=out_path)
+        return
+
     if not args.cve:
-        print("ERROR: --cve is required", file=sys.stderr)
+        print("ERROR: --cve is required (or use --discover-year)", file=sys.stderr)
         sys.exit(1)
 
     cve = args.cve.upper()
     print(f"[+] Searching PoC for {cve}")
 
-    found = search_repos(token, cve)
+    found = search_repos(token, query=f"{cve} in:name,description,readme")
     path = cve_path(cve)
 
     existing = load_existing(path)
@@ -209,4 +252,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
