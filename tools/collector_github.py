@@ -16,7 +16,8 @@ EXCLUDE_FULL_NAMES = {
     "nomi-sec/PoC-in-GitHub",
 }
 
-CVE_RE = re.compile(r"\bCVE-(\d{4})-(\d{4,})\b", re.IGNORECASE)
+# Allow 3+ digits after year (e.g. CVE-2026-666) and normalize to 4 digits (0666)
+CVE_RE = re.compile(r"\bCVE-(\d{4})-(\d{3,})\b", re.IGNORECASE)
 
 
 # ---------- utils ----------
@@ -158,10 +159,20 @@ def merge(existing: list[dict], found: list[dict]) -> list[dict]:
 
 # ---------- discovery (year -> CVE list) ----------
 
+def normalize_cve(year: str, seq: str) -> str:
+    """
+    Accepts seq with 3+ digits. If 3 digits, zero-pad to 4.
+    Keeps 4+ as-is. Always uppercases.
+    """
+    seq = str(seq).strip()
+    if len(seq) < 4:
+        seq = seq.zfill(4)
+    return f"CVE-{year}-{seq}".upper()
+
+
 def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
     cves: set[str] = set()
 
-    # from repo name (often exact)
     full_name = repo.get("full_name") or ""
     name = repo.get("name") or ""
     desc = repo.get("description") or ""
@@ -169,19 +180,17 @@ def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
     for text in (full_name, name, desc):
         for m in CVE_RE.finditer(text):
             if m.group(1) == year:
-                cves.add(f"CVE-{year}-{m.group(2)}".upper())
+                cves.add(normalize_cve(year, m.group(2)))
 
-    # topics sometimes contain cve-202x-xxxx
     for t in repo.get("topics", []) or []:
         for m in CVE_RE.finditer(str(t)):
             if m.group(1) == year:
-                cves.add(f"CVE-{year}-{m.group(2)}".upper())
+                cves.add(normalize_cve(year, m.group(2)))
 
     return cves
 
 
 def discover_year_to_queue(token: str, year: str, pages: int, out_path: Path) -> None:
-    # Query that finds repos mentioning CVE-YYYY- in name/desc/readme
     query = f"CVE-{year}- in:name,description,readme"
 
     all_cves: set[str] = set()
@@ -212,7 +221,8 @@ def main() -> None:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cve", help="Process single CVE, e.g. CVE-2026-22444")
     ap.add_argument("--discover-year", help="Discover CVEs for a given year from GitHub, e.g. 2026")
-    ap.add_argument("--discover-pages", type=int, default=5, help="How many search pages to scan (100 repos/page). Default: 5")
+    ap.add_argument("--discover-pages", type=int, default=5,
+                    help="How many search pages to scan (100 repos/page). Default: 5")
     args = ap.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
