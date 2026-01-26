@@ -19,8 +19,8 @@ jobs:
     # Tune these values to control progress and rate limits.
     env:
       YEAR: "2026"        # Queue file: tools/queue_${YEAR}.txt
-      BATCH_SIZE: "20"    # How many CVEs to process per run
-      SLEEP_SECONDS: "2"  # Sleep between CVEs to be gentle to GitHub API
+      BATCH_SIZE: "5"     # Start small to avoid Search API limits
+      SLEEP_SECONDS: "5"  # Gentle delay between CVEs
 
     steps:
       - name: Checkout
@@ -42,7 +42,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           QUEUE="tools/queue_${YEAR}.txt"
 
@@ -55,58 +55,47 @@ jobs:
           echo "[+] Batch size: ${BATCH_SIZE}"
           echo "[+] Queue file: ${QUEUE}"
 
-          # Read first N CVEs from the queue and process them one by one.
+          processed=0
+
+          # Process first N CVEs. If we hit rate limit (exit code 3), stop early but keep workflow going.
           head -n "${BATCH_SIZE}" "${QUEUE}" | while read -r cve; do
-            # Skip empty lines just in case.
-            if [ -z "${cve}" ]; then
-              continue
-            fi
+            [ -z "${cve}" ] && continue
 
             echo "[+] Collecting: ${cve}"
             python tools/collector_github.py --cve "${cve}"
+            rc=$?
 
-            # Gentle delay to reduce burstiness.
+            # Exit code 3 = rate limit hit inside collector (we stop batch early)
+            if [ "${rc}" -eq 3 ]; then
+              echo "[!] Rate limit reached. Stopping batch early."
+              break
+            fi
+
+            # Any other non-zero is a real error
+            if [ "${rc}" -ne 0 ]; then
+              echo "[!] Collector failed with exit code ${rc}"
+              exit "${rc}"
+            fi
+
+            processed=$((processed+1))
             sleep "${SLEEP_SECONDS}"
           done
 
+          echo "[+] Processed CVEs: ${processed}"
+
       - name: Commit & push if changed
         run: |
-  set -uo pipefail
+          set -euo pipefail
 
-  QUEUE="tools/queue_${YEAR}.txt"
+          git config user.name "kvitrax-bot"
+          git config user.email "kvitrax-bot@users.noreply.github.com"
 
-  if [ ! -f "$QUEUE" ]; then
-    echo "ERROR: Queue file not found: $QUEUE"
-    exit 1
-  fi
+          git add -A
 
-  echo "[+] Year: ${YEAR}"
-  echo "[+] Batch size: ${BATCH_SIZE}"
-  echo "[+] Queue file: ${QUEUE}"
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
 
-  processed=0
-
-  head -n "${BATCH_SIZE}" "${QUEUE}" | while read -r cve; do
-    [ -z "${cve}" ] && continue
-
-    echo "[+] Collecting: ${cve}"
-    python tools/collector_github.py --cve "${cve}"
-    rc=$?
-
-    # Exit code 3 = rate limit (we stop batch but keep job successful to commit what we have)
-    if [ "$rc" -eq 3 ]; then
-      echo "[!] Rate limit reached. Stopping batch early."
-      break
-    fi
-
-    # Any other non-zero is a real error
-    if [ "$rc" -ne 0 ]; then
-      echo "[!] Collector failed with exit code ${rc}"
-      exit "$rc"
-    fi
-
-    processed=$((processed+1))
-    sleep "${SLEEP_SECONDS}"
-  done
-
-  echo "[+] Processed CVEs: ${processed}"
+          git commit -m "Update PoC registry (batch)"
+          git push
