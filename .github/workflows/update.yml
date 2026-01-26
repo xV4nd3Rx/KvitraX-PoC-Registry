@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: kvitrax-poc-registry
+  cancel-in-progress: true
+
 jobs:
   update:
     runs-on: ubuntu-latest
