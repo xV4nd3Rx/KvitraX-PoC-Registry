@@ -17,7 +17,7 @@ EXCLUDE_FULL_NAMES = {
     "LulzSecToolkit/Lulz4Life",
 }
 
-# Allow 3+ digits after year (e.g. CVE-2026-666) and normalize to 4 digits (0666)
+# Allow 3+ digits after year (e.g. CVE-2026-666) and normalize queue to 4 digits (0666)
 CVE_RE = re.compile(r"\bCVE-(\d{4})-(\d{3,})\b", re.IGNORECASE)
 
 
@@ -46,7 +46,7 @@ def gh_get(url: str, token: str, params: dict | None = None) -> requests.Respons
     return requests.get(url, headers=gh_headers(token), params=params, timeout=45)
 
 
-# ---------- GitHub search ----------
+# ---------- GitHub search helpers ----------
 
 def cve_search_variants(cve: str) -> list[str]:
     """
@@ -64,15 +64,13 @@ def cve_search_variants(cve: str) -> list[str]:
     variants = [f"CVE-{year}-{seq}"]
 
     # If sequence has leading zeros, also search for non-padded form
-    seq_unpadded = seq.lstrip("0")
-    if seq_unpadded == "":
-        seq_unpadded = "0"
+    seq_unpadded = seq.lstrip("0") or "0"
     if seq_unpadded != seq:
         variants.append(f"CVE-{year}-{seq_unpadded}")
 
     # Deduplicate while preserving order
-    out = []
-    seen = set()
+    out: list[str] = []
+    seen: set[str] = set()
     for v in variants:
         if v not in seen:
             out.append(v)
@@ -80,36 +78,73 @@ def cve_search_variants(cve: str) -> list[str]:
     return out
 
 
+def repo_mentions_any_variant(repo: dict, variants: list[str]) -> bool:
+    """
+    Hard post-filter: keep only repos that mention exact CVE variant
+    in repository metadata (name/full_name/description/topics).
+    This blocks Search API noise from polluting JSON.
+    """
+    name = (repo.get("name") or "")
+    full_name = (repo.get("full_name") or "")
+    desc = (repo.get("description") or "")
+    topics = repo.get("topics") or []
+
+    blob = "\n".join([
+        str(name),
+        str(full_name),
+        str(desc),
+        " ".join([str(t) for t in topics]),
+    ]).upper()
+
+    for v in variants:
+        if v.upper() in blob:
+            return True
+    return False
+
+
+def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> list[dict]:
+    """
+    Generic GitHub repository search (paged).
+    Used by discovery mode (--discover-year).
+    """
+    url = f"{GITHUB_API}/search/repositories"
+    params = {
+        "q": query,
+        "per_page": per_page,
+        "page": page,
+        "sort": "indexed",
+        "order": "desc",
+    }
+
+    r = gh_get(url, token, params=params)
+
+    # Graceful stop for workflows if Search API rate limit hits
+    if r.status_code == 403 and "rate limit" in r.text.lower():
+        print(f"[!] Rate limit hit on query: {query}", file=sys.stderr)
+        print(r.text, file=sys.stderr)
+        sys.exit(3)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
+
+    items = r.json().get("items", [])
+
+    # Filter known noisy repos
+    filtered = [repo for repo in items if repo.get("full_name") not in EXCLUDE_FULL_NAMES]
+    if len(items) != len(filtered):
+        print(f"[!] Filtered out {len(items) - len(filtered)} aggregator repos")
+
+    return filtered
+
+
 def search_repos_for_cve(token: str, cve: str) -> list[dict]:
     """
     Strategy:
     - 1 request: (CVE-YYYY-0666 OR CVE-YYYY-666) in:name
     - fallback 1 request: ( ... ) in:name,description,readme
-    This reduces Search API calls drastically.
+    Additionally applies a hard post-filter: CVE must be present in repo metadata.
     """
     variants = cve_search_variants(cve)
-    seen_ids: set[int] = set()
-    all_items: list[dict] = []
-
-    def run_query(q: str) -> list[dict]:
-        url = f"{GITHUB_API}/search/repositories"
-        params = {"q": q, "per_page": 100, "sort": "indexed", "order": "desc"}
-        r = gh_get(url, token, params=params)
-
-        if r.status_code == 403 and "rate limit" in r.text.lower():
-            # Special exit code for rate limit; workflow will stop batch gracefully.
-            print(f"[!] Rate limit hit on query: {q}", file=sys.stderr)
-            print(r.text, file=sys.stderr)
-            sys.exit(3)
-
-        if r.status_code != 200:
-            raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
-
-        items = r.json().get("items", [])
-        filtered = [repo for repo in items if repo.get("full_name") not in EXCLUDE_FULL_NAMES]
-        if len(items) != len(filtered):
-            print(f"[!] Filtered out {len(items) - len(filtered)} aggregator repos")
-        return filtered
 
     # Build a single OR query for all variants
     if len(variants) == 1:
@@ -117,8 +152,16 @@ def search_repos_for_cve(token: str, cve: str) -> list[dict]:
     else:
         or_part = "(" + " OR ".join(variants) + ")"
 
+    seen_ids: set[int] = set()
+    all_items: list[dict] = []
+
     # 1) Tight: name-only
-    items = run_query(f"{or_part} in:name")
+    items = search_repos(token, query=f"{or_part} in:name", per_page=100, page=1)
+    before = len(items)
+    items = [r for r in items if repo_mentions_any_variant(r, variants)]
+    if before != len(items):
+        print(f"[!] Post-filter kept {len(items)}/{before} repos after exact CVE check (name-only)")
+
     for repo in items:
         rid = repo.get("id")
         if isinstance(rid, int) and rid not in seen_ids:
@@ -127,7 +170,12 @@ def search_repos_for_cve(token: str, cve: str) -> list[dict]:
 
     # 2) Fallback only if empty
     if not all_items:
-        items = run_query(f"{or_part} in:name,description,readme")
+        items = search_repos(token, query=f"{or_part} in:name,description,readme", per_page=100, page=1)
+        before = len(items)
+        items = [r for r in items if repo_mentions_any_variant(r, variants)]
+        if before != len(items):
+            print(f"[!] Post-filter kept {len(items)}/{before} repos after exact CVE check (fallback)")
+
         for repo in items:
             rid = repo.get("id")
             if isinstance(rid, int) and rid not in seen_ids:
@@ -213,7 +261,7 @@ def merge(existing: list[dict], found: list[dict]) -> list[dict]:
 
     added = 0
     for repo in found:
-        if repo["id"] not in known_ids:
+        if repo.get("id") not in known_ids:
             safe_existing.append(normalize_repo(repo))
             added += 1
 
@@ -257,6 +305,7 @@ def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
 
 
 def discover_year_to_queue(token: str, year: str, pages: int, out_path: Path) -> None:
+    # Discovery is inherently noisy; we accept it because we only extract CVE patterns from metadata.
     query = f"CVE-{year}- in:name,description,readme"
 
     all_cves: set[str] = set()
@@ -313,7 +362,7 @@ def main() -> None:
         print("ERROR: --cve is required (or use --discover-year)", file=sys.stderr)
         sys.exit(1)
 
-    cve = args.cve.upper()
+    cve = args.cve.upper().strip()
     print(f"[+] Searching PoC for {cve}")
 
     found = search_repos_for_cve(token, cve)
