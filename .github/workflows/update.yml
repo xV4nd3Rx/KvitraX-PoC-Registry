@@ -67,17 +67,42 @@ jobs:
 
       - name: Commit & push if changed
         run: |
-          set -euo pipefail
+  set -uo pipefail
 
-          git config user.name "kvitrax-bot"
-          git config user.email "kvitrax-bot@users.noreply.github.com"
+  QUEUE="tools/queue_${YEAR}.txt"
 
-          git add -A
+  if [ ! -f "$QUEUE" ]; then
+    echo "ERROR: Queue file not found: $QUEUE"
+    exit 1
+  fi
 
-          if git diff --cached --quiet; then
-            echo "No changes"
-            exit 0
-          fi
+  echo "[+] Year: ${YEAR}"
+  echo "[+] Batch size: ${BATCH_SIZE}"
+  echo "[+] Queue file: ${QUEUE}"
 
-          git commit -m "Update PoC registry (batch)"
-          git push
+  processed=0
+
+  head -n "${BATCH_SIZE}" "${QUEUE}" | while read -r cve; do
+    [ -z "${cve}" ] && continue
+
+    echo "[+] Collecting: ${cve}"
+    python tools/collector_github.py --cve "${cve}"
+    rc=$?
+
+    # Exit code 3 = rate limit (we stop batch but keep job successful to commit what we have)
+    if [ "$rc" -eq 3 ]; then
+      echo "[!] Rate limit reached. Stopping batch early."
+      break
+    fi
+
+    # Any other non-zero is a real error
+    if [ "$rc" -ne 0 ]; then
+      echo "[!] Collector failed with exit code ${rc}"
+      exit "$rc"
+    fi
+
+    processed=$((processed+1))
+    sleep "${SLEEP_SECONDS}"
+  done
+
+  echo "[+] Processed CVEs: ${processed}"
