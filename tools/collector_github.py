@@ -83,43 +83,56 @@ def cve_search_variants(cve: str) -> list[str]:
 def search_repos_for_cve(token: str, cve: str) -> list[dict]:
     """
     Strategy:
-    1) Tight search: in:name (high precision, low noise)
-    2) Fallback: in:name,description,readme (higher recall)
-    Also searches both padded and unpadded CVE variants.
+    - 1 request: (CVE-YYYY-0666 OR CVE-YYYY-666) in:name
+    - fallback 1 request: ( ... ) in:name,description,readme
+    This reduces Search API calls drastically.
     """
-    all_items: list[dict] = []
+    variants = cve_search_variants(cve)
     seen_ids: set[int] = set()
+    all_items: list[dict] = []
 
-    def run_query(q: str) -> None:
+    def run_query(q: str) -> list[dict]:
         url = f"{GITHUB_API}/search/repositories"
         params = {"q": q, "per_page": 100, "sort": "indexed", "order": "desc"}
         r = gh_get(url, token, params=params)
+
+        if r.status_code == 403 and "rate limit" in r.text.lower():
+            # Special exit code for rate limit; workflow will stop batch gracefully.
+            print(f"[!] Rate limit hit on query: {q}", file=sys.stderr)
+            print(r.text, file=sys.stderr)
+            sys.exit(3)
+
         if r.status_code != 200:
             raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
 
         items = r.json().get("items", [])
-        # Filter known noisy repos
-        filtered = [
-            repo for repo in items
-            if repo.get("full_name") not in EXCLUDE_FULL_NAMES
-        ]
+        filtered = [repo for repo in items if repo.get("full_name") not in EXCLUDE_FULL_NAMES]
+        if len(items) != len(filtered):
+            print(f"[!] Filtered out {len(items) - len(filtered)} aggregator repos")
+        return filtered
 
-        for repo in filtered:
+    # Build a single OR query for all variants
+    if len(variants) == 1:
+        or_part = variants[0]
+    else:
+        or_part = "(" + " OR ".join(variants) + ")"
+
+    # 1) Tight: name-only
+    items = run_query(f"{or_part} in:name")
+    for repo in items:
+        rid = repo.get("id")
+        if isinstance(rid, int) and rid not in seen_ids:
+            seen_ids.add(rid)
+            all_items.append(repo)
+
+    # 2) Fallback only if empty
+    if not all_items:
+        items = run_query(f"{or_part} in:name,description,readme")
+        for repo in items:
             rid = repo.get("id")
             if isinstance(rid, int) and rid not in seen_ids:
                 seen_ids.add(rid)
                 all_items.append(repo)
-
-    variants = cve_search_variants(cve)
-
-    # 1) Tight: repo name only
-    for v in variants:
-        run_query(f"{v} in:name")
-
-    # 2) Fallback if nothing found
-    if not all_items:
-        for v in variants:
-            run_query(f"{v} in:name,description,readme")
 
     if all_items:
         print(f"[+] Found {len(all_items)} repos for {cve} (variants: {variants})")
