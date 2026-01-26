@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 EXCLUDE_FULL_NAMES = {
     "nomi-sec/PoC-in-GitHub",
+    "LulzSecToolkit/Lulz4Life",
 }
 
 # Allow 3+ digits after year (e.g. CVE-2026-666) and normalize to 4 digits (0666)
@@ -302,7 +303,7 @@ def main() -> None:
     cve = args.cve.upper()
     print(f"[+] Searching PoC for {cve}")
 
-    found = search_repos(token, query=f"{cve} in:name,description,readme")
+    found = search_repos_for_cve(token, cve)
     path = cve_path(cve)
 
     existing = load_existing(path)
