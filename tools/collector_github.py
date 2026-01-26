@@ -47,31 +47,83 @@ def gh_get(url: str, token: str, params: dict | None = None) -> requests.Respons
 
 # ---------- GitHub search ----------
 
-def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> list[dict]:
-    url = f"{GITHUB_API}/search/repositories"
-    params = {
-        "q": query,
-        "per_page": per_page,
-        "page": page,
-        "sort": "indexed",
-        "order": "desc",
-    }
+def cve_search_variants(cve: str) -> list[str]:
+    """
+    Return CVE variants for search.
+    Example: CVE-2026-0666 -> ["CVE-2026-0666", "CVE-2026-666"]
+    """
+    cve = cve.upper().strip()
+    parts = cve.split("-")
+    if len(parts) != 3:
+        return [cve]
 
-    r = gh_get(url, token, params=params)
-    if r.status_code != 200:
-        raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
+    year = parts[1]
+    seq = parts[2]
 
-    items = r.json().get("items", [])
+    variants = [f"CVE-{year}-{seq}"]
 
-    filtered = [
-        repo for repo in items
-        if repo.get("full_name") not in EXCLUDE_FULL_NAMES
-    ]
+    # If sequence has leading zeros, also search for non-padded form
+    seq_unpadded = seq.lstrip("0")
+    if seq_unpadded == "":
+        seq_unpadded = "0"
+    if seq_unpadded != seq:
+        variants.append(f"CVE-{year}-{seq_unpadded}")
 
-    if len(items) != len(filtered):
-        print(f"[!] Filtered out {len(items) - len(filtered)} aggregator repos")
+    # Deduplicate while preserving order
+    out = []
+    seen = set()
+    for v in variants:
+        if v not in seen:
+            out.append(v)
+            seen.add(v)
+    return out
 
-    return filtered
+
+def search_repos_for_cve(token: str, cve: str) -> list[dict]:
+    """
+    Strategy:
+    1) Tight search: in:name (high precision, low noise)
+    2) Fallback: in:name,description,readme (higher recall)
+    Also searches both padded and unpadded CVE variants.
+    """
+    all_items: list[dict] = []
+    seen_ids: set[int] = set()
+
+    def run_query(q: str) -> None:
+        url = f"{GITHUB_API}/search/repositories"
+        params = {"q": q, "per_page": 100, "sort": "indexed", "order": "desc"}
+        r = gh_get(url, token, params=params)
+        if r.status_code != 200:
+            raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
+
+        items = r.json().get("items", [])
+        # Filter known noisy repos
+        filtered = [
+            repo for repo in items
+            if repo.get("full_name") not in EXCLUDE_FULL_NAMES
+        ]
+
+        for repo in filtered:
+            rid = repo.get("id")
+            if isinstance(rid, int) and rid not in seen_ids:
+                seen_ids.add(rid)
+                all_items.append(repo)
+
+    variants = cve_search_variants(cve)
+
+    # 1) Tight: repo name only
+    for v in variants:
+        run_query(f"{v} in:name")
+
+    # 2) Fallback if nothing found
+    if not all_items:
+        for v in variants:
+            run_query(f"{v} in:name,description,readme")
+
+    if all_items:
+        print(f"[+] Found {len(all_items)} repos for {cve} (variants: {variants})")
+
+    return all_items
 
 
 # ---------- filesystem ----------
