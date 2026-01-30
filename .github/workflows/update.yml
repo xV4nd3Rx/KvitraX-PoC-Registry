@@ -1,9 +1,9 @@
-name: Update PoC Registry
+name: Update PoC Registry (auto years 2026->1999)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */6 * * *" # Every 6 hours
+    - cron: "17 */4 * * *" # Every 4 hours
 
 permissions:
   contents: write
@@ -16,11 +16,16 @@ jobs:
   update:
     runs-on: ubuntu-latest
 
-    # Tune these values to control progress and rate limits.
     env:
-      YEAR: "2026"        # Queue file: tools/queue_${YEAR}.txt
-      BATCH_SIZE: "5"     # Start small to avoid Search API limits
-      SLEEP_SECONDS: "5"  # Gentle delay between CVEs
+      START_YEAR: "2026"
+      END_YEAR: "1999"
+
+      # Tune these values to control progress & rate limits.
+      BATCH_SIZE: "5"
+      SLEEP_SECONDS: "5"
+
+      # Optional: pass throttling to collector if you implemented it (safe to keep)
+      THROTTLE_SECONDS: "2.2"
 
     steps:
       - name: Checkout
@@ -38,50 +43,138 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r tools/requirements.txt
 
-      - name: Run collector (batch from queue)
+      - name: Run collector (auto year + progress)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          QUEUE="tools/queue_${YEAR}.txt"
+          PROGRESS_YEAR="tools/progress_year.txt"
 
-          if [ ! -f "$QUEUE" ]; then
-            echo "ERROR: Queue file not found: $QUEUE"
+          # Init current year pointer if missing
+          if [ ! -f "$PROGRESS_YEAR" ]; then
+            echo "${START_YEAR}" > "$PROGRESS_YEAR"
+          fi
+
+          cur_year="$(cat "$PROGRESS_YEAR" | tr -d '[:space:]')"
+          if ! echo "$cur_year" | grep -Eq '^[0-9]{4}$'; then
+            echo "ERROR: invalid year in $PROGRESS_YEAR: $cur_year"
             exit 1
           fi
 
-          echo "[+] Year: ${YEAR}"
+          # Find next available queue starting from cur_year down to END_YEAR
+          selected_year=""
+          y="$cur_year"
+          while [ "$y" -ge "$END_YEAR" ]; do
+            if [ -f "tools/queue_${y}.txt" ]; then
+              selected_year="$y"
+              break
+            fi
+            y=$((y-1))
+          done
+
+          if [ -z "$selected_year" ]; then
+            echo "ERROR: No queue files found from ${cur_year} down to ${END_YEAR}"
+            exit 1
+          fi
+
+          # Use selected year (may be < cur_year if some queues missing)
+          year="$selected_year"
+          echo "[+] Selected YEAR=$year"
+
+          QUEUE="tools/queue_${year}.txt"
+          PROGRESS="tools/progress_${year}.txt"
+          DONE_MARK="tools/results_${year}.done"
+
+          total_lines="$(wc -l < "$QUEUE" | tr -d '[:space:]')"
+          if [ "$total_lines" -eq 0 ]; then
+            echo "ERROR: Empty queue: $QUEUE"
+            exit 1
+          fi
+
+          # Cursor: 1-based line number
+          if [ -f "$PROGRESS" ]; then
+            start_line="$(cat "$PROGRESS" | tr -d '[:space:]')"
+          else
+            start_line="1"
+          fi
+
+          if ! echo "$start_line" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: Invalid progress value in $PROGRESS: $start_line"
+            exit 1
+          fi
+
+          # If cursor beyond end, treat as completed -> wrap
+          if [ "$start_line" -gt "$total_lines" ]; then
+            start_line="1"
+          fi
+
+          echo "[+] Queue: $QUEUE"
+          echo "[+] Total CVEs in queue: $total_lines"
+          echo "[+] Start line: $start_line"
           echo "[+] Batch size: ${BATCH_SIZE}"
-          echo "[+] Queue file: ${QUEUE}"
+
+          # Read next batch into array (avoid subshell issues)
+          mapfile -t batch < <(tail -n +"$start_line" "$QUEUE" | head -n "$BATCH_SIZE" | sed '/^[[:space:]]*$/d')
 
           processed=0
+          next_line="$start_line"
+          hit_rate_limit="0"
 
-          # Process first N CVEs. If we hit rate limit (exit code 3), stop early but keep workflow going.
-          head -n "${BATCH_SIZE}" "${QUEUE}" | while read -r cve; do
-            [ -z "${cve}" ] && continue
-
+          for cve in "${batch[@]}"; do
             echo "[+] Collecting: ${cve}"
-            python tools/collector_github.py --cve "${cve}"
-            rc=$?
 
-            # Exit code 3 = rate limit hit inside collector (we stop batch early)
-            if [ "${rc}" -eq 3 ]; then
+            # If your collector supports --throttle-seconds / --cve-pages, you can add them here
+            python tools/collector_github.py --cve "${cve}" || rc=$?
+            rc="${rc:-0}"
+
+            if [ "$rc" -eq 3 ]; then
               echo "[!] Rate limit reached. Stopping batch early."
+              hit_rate_limit="1"
               break
             fi
 
-            # Any other non-zero is a real error
-            if [ "${rc}" -ne 0 ]; then
+            if [ "$rc" -ne 0 ]; then
               echo "[!] Collector failed with exit code ${rc}"
               exit "${rc}"
             fi
 
             processed=$((processed+1))
+            next_line=$((next_line+1))
             sleep "${SLEEP_SECONDS}"
           done
 
-          echo "[+] Processed CVEs: ${processed}"
+          # Determine if we finished the year (cursor passed end)
+          finished_year="0"
+          if [ "$next_line" -gt "$total_lines" ]; then
+            finished_year="1"
+            next_line="1"
+          fi
+
+          # Save progress for this year
+          echo "$next_line" > "$PROGRESS"
+          echo "[+] Processed CVEs: $processed"
+          echo "[+] Next line: $next_line"
+
+          # If finished (and we didn't stop due to rate limit), mark done and move year pointer down
+          if [ "$finished_year" -eq 1 ] && [ "$hit_rate_limit" -eq 0 ]; then
+            echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') finished YEAR=${year}" > "$DONE_MARK"
+            echo "[+] Marked done: $DONE_MARK"
+
+            next_year=$((year-1))
+            if [ "$next_year" -lt "$END_YEAR" ]; then
+              # Completed all years -> reset pointer to START_YEAR (or keep END_YEAR, your choice)
+              echo "${START_YEAR}" > "$PROGRESS_YEAR"
+              echo "[+] All years completed. Reset YEAR pointer to ${START_YEAR}"
+            else
+              echo "$next_year" > "$PROGRESS_YEAR"
+              echo "[+] Move YEAR pointer to ${next_year}"
+            fi
+          else
+            # Keep working on the same year
+            echo "$year" > "$PROGRESS_YEAR"
+            echo "[+] Keep YEAR pointer at ${year}"
+          fi
 
       - name: Commit & push if changed
         run: |
@@ -97,5 +190,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update PoC registry (batch)"
+          git commit -m "Update PoC registry (auto years batch)"
           git push
