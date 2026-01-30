@@ -3,9 +3,11 @@ import os
 import sys
 import json
 import re
+import time
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import requests
 
@@ -17,15 +19,12 @@ EXCLUDE_FULL_NAMES = {
     "LulzSecToolkit/Lulz4Life",
 }
 
-# Allow 3+ digits after year (e.g. CVE-2026-666) and normalize queue to 4 digits (0666)
-CVE_RE = re.compile(r"\bCVE-(\d{4})-(\d{3,})\b", re.IGNORECASE)
+CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
+
+DEFAULT_SEARCH_THROTTLE_SECONDS = 2.2  # safe-ish for Search API; adjust with --throttle-seconds
 
 
 # ---------- utils ----------
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
 
 def ensure_token(token: str) -> None:
     if not token or len(token.strip()) < 10:
@@ -42,17 +41,110 @@ def gh_headers(token: str) -> dict:
     }
 
 
-def gh_get(url: str, token: str, params: dict | None = None) -> requests.Response:
-    return requests.get(url, headers=gh_headers(token), params=params, timeout=45)
+def _parse_int(v: Optional[str], default: int = 0) -> int:
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
 
-# ---------- GitHub search helpers ----------
+def _sleep_until(reset_epoch: int, extra_seconds: float = 2.0) -> None:
+    now = int(time.time())
+    wait = max(1, reset_epoch - now) + int(extra_seconds)
+    print(f"[!] Rate limit: sleeping {wait}s until reset (reset_epoch={reset_epoch}, now={now})")
+    time.sleep(wait)
+
+
+def gh_request(
+    method: str,
+    url: str,
+    token: str,
+    params: dict | None = None,
+    *,
+    throttle_seconds: float = 0.0,
+    max_retries: int = 6,
+) -> requests.Response:
+    """
+    A resilient GitHub requester:
+    - optionally throttles (sleep) before request
+    - handles 403 rate limit by sleeping until reset and retrying
+    - handles Retry-After if present (secondary limit)
+    """
+    s = requests.Session()
+    headers = gh_headers(token)
+
+    for attempt in range(1, max_retries + 1):
+        if throttle_seconds and throttle_seconds > 0:
+            time.sleep(throttle_seconds)
+
+        r = s.request(method, url, headers=headers, params=params, timeout=45)
+
+        # Success
+        if r.status_code < 400:
+            return r
+
+        # Try to detect rate limits / secondary limits
+        msg = ""
+        try:
+            j = r.json()
+            msg = str(j.get("message", "")) if isinstance(j, dict) else ""
+        except Exception:
+            msg = r.text or ""
+
+        msg_l = msg.lower()
+
+        # Respect Retry-After if present
+        retry_after = _parse_int(r.headers.get("Retry-After"), default=0)
+        if retry_after > 0:
+            print(f"[!] Retry-After={retry_after}s (status={r.status_code}) on {url}")
+            time.sleep(retry_after + 1)
+            continue
+
+        # Rate limit exceeded => sleep until reset
+        if r.status_code == 403 and ("rate limit" in msg_l or "secondary rate limit" in msg_l):
+            reset_epoch = _parse_int(r.headers.get("X-RateLimit-Reset"), default=0)
+            remaining = _parse_int(r.headers.get("X-RateLimit-Remaining"), default=-1)
+            limit = _parse_int(r.headers.get("X-RateLimit-Limit"), default=-1)
+
+            print(f"[!] Rate limit hit (attempt {attempt}/{max_retries}) "
+                  f"remaining={remaining} limit={limit} reset={reset_epoch} url={url}")
+            if reset_epoch > 0:
+                _sleep_until(reset_epoch, extra_seconds=3.0)
+                continue
+
+            # If no reset header, fallback: exponential backoff
+            backoff = min(120, 2 ** attempt)
+            print(f"[!] No reset header, backing off {backoff}s. Message: {msg}")
+            time.sleep(backoff)
+            continue
+
+        # Other errors: retry with backoff a bit, then give up
+        if attempt < max_retries and r.status_code in (500, 502, 503, 504):
+            backoff = min(60, 2 ** attempt)
+            print(f"[!] Server error {r.status_code}, retrying in {backoff}s")
+            time.sleep(backoff)
+            continue
+
+        # Final fail
+        raise RuntimeError(f"GitHub request failed: {r.status_code} {msg} (url={url})")
+
+    raise RuntimeError(f"GitHub request failed after {max_retries} retries (url={url})")
+
+
+def gh_get_json(
+    url: str,
+    token: str,
+    params: dict | None = None,
+    *,
+    throttle_seconds: float = 0.0,
+) -> dict:
+    r = gh_request("GET", url, token, params=params, throttle_seconds=throttle_seconds)
+    return r.json()
+
+
+# ---------- CVE helpers ----------
 
 def cve_search_variants(cve: str) -> list[str]:
-    """
-    Return CVE variants for search.
-    Example: CVE-2026-0666 -> ["CVE-2026-0666", "CVE-2026-666"]
-    """
     cve = cve.upper().strip()
     parts = cve.split("-")
     if len(parts) != 3:
@@ -62,13 +154,10 @@ def cve_search_variants(cve: str) -> list[str]:
     seq = parts[2]
 
     variants = [f"CVE-{year}-{seq}"]
-
-    # If sequence has leading zeros, also search for non-padded form
     seq_unpadded = seq.lstrip("0") or "0"
     if seq_unpadded != seq:
         variants.append(f"CVE-{year}-{seq_unpadded}")
 
-    # Deduplicate while preserving order
     out: list[str] = []
     seen: set[str] = set()
     for v in variants:
@@ -78,12 +167,14 @@ def cve_search_variants(cve: str) -> list[str]:
     return out
 
 
+def normalize_cve(year: str, seq: str) -> str:
+    seq = str(seq).strip()
+    if len(seq) < 4:
+        seq = seq.zfill(4)
+    return f"CVE-{year}-{seq}".upper()
+
+
 def repo_mentions_any_variant(repo: dict, variants: list[str]) -> bool:
-    """
-    Hard post-filter: keep only repos that mention exact CVE variant
-    in repository metadata (name/full_name/description/topics).
-    This blocks Search API noise from polluting JSON.
-    """
     name = (repo.get("name") or "")
     full_name = (repo.get("full_name") or "")
     desc = (repo.get("description") or "")
@@ -102,11 +193,39 @@ def repo_mentions_any_variant(repo: dict, variants: list[str]) -> bool:
     return False
 
 
-def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> list[dict]:
-    """
-    Generic GitHub repository search (paged).
-    Used by discovery mode (--discover-year).
-    """
+def repo_readme_mentions_any_variant(token: str, full_name: str, variants: list[str]) -> bool:
+    url = f"{GITHUB_API}/repos/{full_name}/readme"
+    try:
+        data = gh_get_json(url, token, throttle_seconds=0.0)
+    except Exception:
+        return False
+
+    content_b64 = data.get("content") or ""
+    if not content_b64:
+        return False
+
+    try:
+        import base64
+        text = base64.b64decode(content_b64).decode("utf-8", errors="ignore").upper()
+    except Exception:
+        return False
+
+    for v in variants:
+        if v.upper() in text:
+            return True
+    return False
+
+
+# ---------- GitHub search ----------
+
+def search_repos(
+    token: str,
+    query: str,
+    per_page: int = 100,
+    page: int = 1,
+    *,
+    throttle_seconds: float = DEFAULT_SEARCH_THROTTLE_SECONDS,
+) -> list[dict]:
     url = f"{GITHUB_API}/search/repositories"
     params = {
         "q": query,
@@ -116,20 +235,9 @@ def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> 
         "order": "desc",
     }
 
-    r = gh_get(url, token, params=params)
+    data = gh_get_json(url, token, params=params, throttle_seconds=throttle_seconds)
+    items = data.get("items", [])
 
-    # Graceful stop for workflows if Search API rate limit hits
-    if r.status_code == 403 and "rate limit" in r.text.lower():
-        print(f"[!] Rate limit hit on query: {query}", file=sys.stderr)
-        print(r.text, file=sys.stderr)
-        sys.exit(3)
-
-    if r.status_code != 200:
-        raise RuntimeError(f"GitHub search failed: {r.status_code} {r.text}")
-
-    items = r.json().get("items", [])
-
-    # Filter known noisy repos
     filtered = [repo for repo in items if repo.get("full_name") not in EXCLUDE_FULL_NAMES]
     if len(items) != len(filtered):
         print(f"[!] Filtered out {len(items) - len(filtered)} aggregator repos")
@@ -137,54 +245,67 @@ def search_repos(token: str, query: str, per_page: int = 100, page: int = 1) -> 
     return filtered
 
 
-def search_repos_for_cve(token: str, cve: str) -> list[dict]:
-    """
-    Strategy:
-    - 1 request: (CVE-YYYY-0666 OR CVE-YYYY-666) in:name
-    - fallback 1 request: ( ... ) in:name,description,readme
-    Additionally applies a hard post-filter: CVE must be present in repo metadata.
-    """
+def search_repos_for_cve(
+    token: str,
+    cve: str,
+    pages: int = 3,
+    verify_readme: bool = True,
+    *,
+    throttle_seconds: float = DEFAULT_SEARCH_THROTTLE_SECONDS,
+) -> list[dict]:
     variants = cve_search_variants(cve)
 
-    # Build a single OR query for all variants
-    if len(variants) == 1:
-        or_part = variants[0]
-    else:
-        or_part = "(" + " OR ".join(variants) + ")"
+    or_part = variants[0] if len(variants) == 1 else "(" + " OR ".join(variants) + ")"
+    pages = max(1, min(int(pages), 10))
+
+    queries = [
+        ("name-only", f"{or_part} in:name"),
+        ("fallback", f"{or_part} in:name,description,readme"),
+    ]
 
     seen_ids: set[int] = set()
     all_items: list[dict] = []
 
-    # 1) Tight: name-only
-    items = search_repos(token, query=f"{or_part} in:name", per_page=100, page=1)
-    before = len(items)
-    items = [r for r in items if repo_mentions_any_variant(r, variants)]
-    if before != len(items):
-        print(f"[!] Post-filter kept {len(items)}/{before} repos after exact CVE check (name-only)")
+    for label, q in queries:
+        scanned = 0
+        kept = 0
+        kept_meta = 0
+        kept_readme = 0
 
-    for repo in items:
-        rid = repo.get("id")
-        if isinstance(rid, int) and rid not in seen_ids:
-            seen_ids.add(rid)
-            all_items.append(repo)
+        for p in range(1, pages + 1):
+            items = search_repos(token, query=q, per_page=100, page=p, throttle_seconds=throttle_seconds)
+            if not items:
+                break
+            scanned += len(items)
 
-    # 2) Fallback only if empty
-    if not all_items:
-        items = search_repos(token, query=f"{or_part} in:name,description,readme", per_page=100, page=1)
-        before = len(items)
-        items = [r for r in items if repo_mentions_any_variant(r, variants)]
-        if before != len(items):
-            print(f"[!] Post-filter kept {len(items)}/{before} repos after exact CVE check (fallback)")
+            for repo in items:
+                rid = repo.get("id")
+                if not isinstance(rid, int) or rid in seen_ids:
+                    continue
 
-        for repo in items:
-            rid = repo.get("id")
-            if isinstance(rid, int) and rid not in seen_ids:
-                seen_ids.add(rid)
-                all_items.append(repo)
+                if repo_mentions_any_variant(repo, variants):
+                    seen_ids.add(rid)
+                    all_items.append(repo)
+                    kept += 1
+                    kept_meta += 1
+                    continue
+
+                if verify_readme and "readme" in q:
+                    full_name = repo.get("full_name") or ""
+                    if full_name and repo_readme_mentions_any_variant(token, full_name, variants):
+                        seen_ids.add(rid)
+                        all_items.append(repo)
+                        kept += 1
+                        kept_readme += 1
+
+        if scanned:
+            print(
+                f"[+] Query {label}: scanned={scanned} kept={kept} "
+                f"(meta={kept_meta}, readme={kept_readme}) pages={pages}"
+            )
 
     if all_items:
         print(f"[+] Found {len(all_items)} repos for {cve} (variants: {variants})")
-
     return all_items
 
 
@@ -198,7 +319,6 @@ def cve_path(cve: str) -> Path:
 def load_existing(path: Path) -> list[dict]:
     if not path.exists():
         return []
-
     raw = path.read_text(encoding="utf-8").strip()
     if not raw:
         return []
@@ -251,7 +371,7 @@ def normalize_repo(repo: dict) -> dict:
         "watchers_count": repo["watchers_count"],
         "forks_count": repo["forks_count"],
         "topics": repo.get("topics", []),
-        "visibility": repo["visibility"],
+        "visibility": repo.get("visibility"),
     }
 
 
@@ -267,22 +387,10 @@ def merge(existing: list[dict], found: list[dict]) -> list[dict]:
 
     safe_existing.sort(key=lambda r: (r.get("created_at", ""), r.get("full_name", "")))
     print(f"[+] Added {added} new PoC repositories")
-
     return safe_existing
 
 
-# ---------- discovery (year -> CVE list) ----------
-
-def normalize_cve(year: str, seq: str) -> str:
-    """
-    Accepts seq with 3+ digits. If 3 digits, zero-pad to 4.
-    Keeps 4+ as-is. Always uppercases.
-    """
-    seq = str(seq).strip()
-    if len(seq) < 4:
-        seq = seq.zfill(4)
-    return f"CVE-{year}-{seq}".upper()
-
+# ---------- discovery (year -> CVE queue) ----------
 
 def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
     cves: set[str] = set()
@@ -290,8 +398,9 @@ def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
     full_name = repo.get("full_name") or ""
     name = repo.get("name") or ""
     desc = repo.get("description") or ""
+    homepage = repo.get("homepage") or ""
 
-    for text in (full_name, name, desc):
+    for text in (full_name, name, desc, homepage):
         for m in CVE_RE.finditer(text):
             if m.group(1) == year:
                 cves.add(normalize_cve(year, m.group(2)))
@@ -304,48 +413,93 @@ def extract_cves_from_repo(repo: dict, year: str) -> set[str]:
     return cves
 
 
-def discover_year_to_queue(token: str, year: str, pages: int, out_path: Path) -> None:
-    # Discovery is inherently noisy; we accept it because we only extract CVE patterns from metadata.
-    query = f"CVE-{year}- in:name,description,readme"
+def _make_discovery_shards(shards: int) -> list[str]:
+    """
+    Flexible shard prefixes generator.
+    - shards <= 10: "0".."shards-1"
+    - shards > 10: zero-padded "00".."shards-1" (width grows as needed)
+    Safety cap: 1..1000
+    """
+    shards = int(shards)
+    shards = max(1, min(shards, 1000))
+
+    if shards <= 10:
+        return [str(i) for i in range(shards)]
+
+    width = len(str(shards - 1))
+    return [f"{i:0{width}d}" for i in range(shards)]
+
+
+def discover_year_to_queue(
+    token: str,
+    year: str,
+    pages: int,
+    out_path: Path,
+    shards: int = 10,
+    *,
+    throttle_seconds: float = DEFAULT_SEARCH_THROTTLE_SECONDS,
+) -> None:
+    pages = max(1, min(int(pages), 10))
+    shard_prefixes = _make_discovery_shards(shards)
 
     all_cves: set[str] = set()
     total_repos = 0
 
-    for page in range(1, pages + 1):
-        repos = search_repos(token, query=query, per_page=100, page=page)
-        if not repos:
-            break
+    for prefix in shard_prefixes:
+        query = f"CVE-{year}-{prefix} in:name,description,readme"
+        shard_repos = 0
+        shard_cves_before = len(all_cves)
 
-        total_repos += len(repos)
+        for p in range(1, pages + 1):
+            repos = search_repos(token, query=query, per_page=100, page=p, throttle_seconds=throttle_seconds)
+            if not repos:
+                break
 
-        for repo in repos:
-            all_cves |= extract_cves_from_repo(repo, year)
+            shard_repos += len(repos)
+            total_repos += len(repos)
 
-        print(f"[+] discover {year}: page {page} -> repos={len(repos)} cves_total={len(all_cves)}")
+            for repo in repos:
+                all_cves |= extract_cves_from_repo(repo, year)
+
+            print(f"[+] discover {year} shard {prefix}: page {p} -> repos={len(repos)} cves_total={len(all_cves)}")
+
+        shard_added = len(all_cves) - shard_cves_before
+        print(f"[+] shard {prefix} done: repos_scanned={shard_repos} new_cves={shard_added}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(sorted(all_cves)) + "\n", encoding="utf-8")
-
-    print(f"[+] Saved queue: {out_path} (cves={len(all_cves)} repos_scanned={total_repos})")
+    print(f"[+] Saved queue: {out_path} (cves={len(all_cves)} repos_scanned={total_repos} shards={shards})")
 
 
 # ---------- main ----------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--cve", help="Process single CVE, e.g. CVE-2026-22444")
-    ap.add_argument("--discover-year", help="Discover CVEs for a given year from GitHub, e.g. 2026")
+
+    ap.add_argument("--selftest", action="store_true", help="Show GitHub API rate limit info")
+
+    ap.add_argument("--cve", help="Process single CVE, e.g. CVE-2017-0144")
+    ap.add_argument("--cve-pages", type=int, default=3,
+                    help="How many search pages to scan per query for a single CVE (100 repos/page). Default: 3 (max 10)")
+    ap.add_argument("--no-readme-verify", action="store_true",
+                    help="Disable README verification for in:readme results (fewer API calls)")
+
+    ap.add_argument("--discover-year", help="Discover CVEs for a given year from GitHub, e.g. 2017")
     ap.add_argument("--discover-pages", type=int, default=5,
-                    help="How many search pages to scan (100 repos/page). Default: 5")
+                    help="How many search pages to scan per shard (100 repos/page). Default: 5 (max 10)")
+    ap.add_argument("--discover-shards", type=int, default=10,
+                    help="Discovery shard count. Default 10. Use 50, 100, etc. Higher = better coverage, slower.")
+    ap.add_argument("--throttle-seconds", type=float, default=DEFAULT_SEARCH_THROTTLE_SECONDS,
+                    help="Sleep before each GitHub Search request. Default 2.2s. Increase if you still hit limits.")
+
     args = ap.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
     ensure_token(token)
 
     if args.selftest:
-        r = gh_get(f"{GITHUB_API}/rate_limit", token)
-        print(json.dumps(r.json(), indent=2))
+        data = gh_get_json(f"{GITHUB_API}/rate_limit", token)
+        print(json.dumps(data, indent=2))
         return
 
     if args.discover_year:
@@ -355,7 +509,14 @@ def main() -> None:
             sys.exit(1)
 
         out_path = ROOT / "tools" / f"queue_{year}.txt"
-        discover_year_to_queue(token, year=year, pages=max(1, args.discover_pages), out_path=out_path)
+        discover_year_to_queue(
+            token,
+            year=year,
+            pages=max(1, args.discover_pages),
+            out_path=out_path,
+            shards=args.discover_shards,
+            throttle_seconds=max(0.0, float(args.throttle_seconds)),
+        )
         return
 
     if not args.cve:
@@ -365,13 +526,18 @@ def main() -> None:
     cve = args.cve.upper().strip()
     print(f"[+] Searching PoC for {cve}")
 
-    found = search_repos_for_cve(token, cve)
-    path = cve_path(cve)
+    found = search_repos_for_cve(
+        token,
+        cve,
+        pages=args.cve_pages,
+        verify_readme=(not args.no_readme_verify),
+        throttle_seconds=max(0.0, float(args.throttle_seconds)),
+    )
 
+    path = cve_path(cve)
     existing = load_existing(path)
     merged = merge(existing, found)
     save(path, merged)
-
     print(f"[+] Saved {len(merged)} entries → {path.relative_to(ROOT)}")
 
 
