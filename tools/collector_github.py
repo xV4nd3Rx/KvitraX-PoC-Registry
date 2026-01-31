@@ -29,6 +29,9 @@ EXCLUDE_FULL_NAMES = {
     "killvxk/gitweekly",
     "CPAtoCybersecurity/GRC_News_Assistant_3",
     "DevGreick/devgreick",
+    "rxerium/stars",
+    "packetinside/CISA_BOT",
+    "plzheheplztrying/cve_monitor",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
