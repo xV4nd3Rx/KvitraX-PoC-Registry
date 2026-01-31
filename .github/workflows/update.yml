@@ -3,7 +3,7 @@ name: Update PoC Registry (auto years 2026->1999)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */4 * * *" # Every 4 hours
+    - cron: "17 */2 * * *" # Every 2 hours
 
 permissions:
   contents: write
@@ -21,7 +21,7 @@ jobs:
       END_YEAR: "1999"
 
       # Tune these values to control progress & rate limits.
-      BATCH_SIZE: "5"
+      BATCH_SIZE: "14"
       SLEEP_SECONDS: "5"
 
       # Optional: pass throttling to collector if you implemented it (safe to keep)
