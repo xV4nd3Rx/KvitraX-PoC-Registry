@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 EXCLUDE_FULL_NAMES = {
     "nomi-sec/PoC-in-GitHub",
     "LulzSecToolkit/Lulz4Life",
+    "GhostTroops/TOP",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
