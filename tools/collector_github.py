@@ -18,6 +18,17 @@ EXCLUDE_FULL_NAMES = {
     "nomi-sec/PoC-in-GitHub",
     "LulzSecToolkit/Lulz4Life",
     "GhostTroops/TOP",
+    "tanjiti/sec_profile",
+    "KingOfBugbounty/KingOfBugBountyTips",
+    "DhanushNehru/DhanushNehru",
+    "giterlizzi/secdb-feeds",
+    "galois17/galois17",
+    "Threekiii/CVE",
+    "0xMarcio/cve",
+    "zulloper/cve-poc",
+    "killvxk/gitweekly",
+    "CPAtoCybersecurity/GRC_News_Assistant_3",
+    "DevGreick/devgreick",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
