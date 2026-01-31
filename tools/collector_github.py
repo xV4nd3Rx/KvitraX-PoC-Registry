@@ -32,6 +32,9 @@ EXCLUDE_FULL_NAMES = {
     "rxerium/stars",
     "packetinside/CISA_BOT",
     "plzheheplztrying/cve_monitor",
+    "dellalibera/dellalibera",
+    "Mr-xn/Penetration_Testing_POC",
+    "canomer/CTEM-Framework-Guide",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
