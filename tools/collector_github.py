@@ -35,6 +35,8 @@ EXCLUDE_FULL_NAMES = {
     "dellalibera/dellalibera",
     "Mr-xn/Penetration_Testing_POC",
     "canomer/CTEM-Framework-Guide",
+    "YangSiJun528/awesome-for-me",
+    "defHawk-tech/CVEs",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
