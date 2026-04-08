@@ -38,6 +38,7 @@ EXCLUDE_FULL_NAMES = {
     "YangSiJun528/awesome-for-me",
     "defHawk-tech/CVEs",
     "Muhamed201/HRDocFlow1",
+    "Threekiii/Awesome-POC",
 }
 
 CVE_RE = re.compile(r"CVE-(\d{4})-(\d{3,})", re.IGNORECASE)
