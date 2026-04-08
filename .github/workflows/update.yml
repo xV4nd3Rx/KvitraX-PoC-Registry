@@ -18,7 +18,7 @@ jobs:
 
     env:
       START_YEAR: "2026"
-      END_YEAR: "1999"
+      END_YEAR: "2025"
 
       # Tune these values to control progress & rate limits.
       BATCH_SIZE: "14"
