@@ -3,8 +3,8 @@
 Versioned PoC dataset collected from GitHub for CVE research and threat intelligence.
 
 ## Structure
-- `YYYY/` — year folder
-- `YYYY/CVE-YYYY-NNNNN.json` — one CVE entry with PoC sources
+- `YYYY/` - year folder
+- `YYYY/CVE-YYYY-NNNNN.json` - one CVE entry with PoC sources
 
 ## How data is collected
 PoC entries are discovered via automated GitHub searches using CVE identifiers
