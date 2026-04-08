@@ -1,4 +1,4 @@
-name: Update PoC Registry (auto years 2026->1999)
+name: Update PoC Registry (auto years 2026->2025)
 
 on:
   workflow_dispatch:
